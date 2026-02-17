@@ -2,9 +2,11 @@ import {
   buildChannelConfigSchema,
   collectStatusIssuesFromLastError,
   createDefaultChannelRuntimeState,
+  createReplyPrefixOptions,
   DEFAULT_ACCOUNT_ID,
   formatPairingApproveHint,
   type ChannelPlugin,
+  type OpenClawConfig,
 } from "openclaw/plugin-sdk";
 import type { NostrProfile } from "./config-schema.js";
 import { NostrConfigSchema } from "./config-schema.js";
@@ -210,25 +212,129 @@ export const nostrPlugin: ChannelPlugin<ResolvedNostrAccount> = {
         privateKey: account.privateKey,
         relays: account.relays,
         onMessage: async (senderPubkey, text, reply) => {
-          ctx.log?.debug?.(
+          ctx.log?.info?.(
             `[${account.accountId}] DM from ${senderPubkey}: ${text.slice(0, 50)}...`,
           );
 
-          // Forward to OpenClaw's message pipeline
-          // TODO: Replace with proper dispatchReplyWithBufferedBlockDispatcher call
-          await (
-            runtime.channel.reply as { handleInboundMessage?: (params: unknown) => Promise<void> }
-          ).handleInboundMessage?.({
-            channel: "nostr",
-            accountId: account.accountId,
-            senderId: senderPubkey,
-            chatType: "direct",
-            chatId: senderPubkey, // For DMs, chatId is the sender's pubkey
-            text,
-            reply: async (responseText: string) => {
-              await reply(responseText);
-            },
-          });
+          try {
+            const cfg = runtime.config.loadConfig() as OpenClawConfig;
+            const senderShort = senderPubkey.slice(0, 12);
+
+            const route = runtime.channel.routing.resolveAgentRoute({
+              cfg,
+              channel: "nostr",
+              accountId: account.accountId,
+              peer: { kind: "direct" as const, id: senderPubkey },
+            });
+
+            const storePath = runtime.channel.session.resolveStorePath(cfg.session?.store, {
+              agentId: route.agentId,
+            });
+            const envelopeOptions = runtime.channel.reply.resolveEnvelopeFormatOptions(cfg);
+            const previousTimestamp = runtime.channel.session.readSessionUpdatedAt({
+              storePath,
+              sessionKey: route.sessionKey,
+            });
+
+            const body = runtime.channel.reply.formatAgentEnvelope({
+              channel: "Nostr",
+              from: senderShort,
+              timestamp: Date.now(),
+              previousTimestamp,
+              envelope: envelopeOptions,
+              body: text,
+            });
+
+            const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+              Body: body,
+              RawBody: text,
+              CommandBody: text,
+              From: `nostr:${senderPubkey}`,
+              To: `nostr:${account.publicKey}`,
+              SessionKey: route.sessionKey,
+              AccountId: route.accountId,
+              ChatType: "direct" as const,
+              ConversationLabel: senderShort,
+              SenderId: senderPubkey,
+              Provider: "nostr",
+              Surface: "nostr",
+              MessageSid: `nostr-dm-${Date.now()}`,
+              Timestamp: Date.now(),
+              OriginatingChannel: "nostr",
+              OriginatingTo: `nostr:${senderPubkey}`,
+            });
+
+            await runtime.channel.session.recordInboundSession({
+              storePath,
+              sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+              ctx: ctxPayload,
+              updateLastRoute: {
+                sessionKey: route.mainSessionKey ?? route.sessionKey,
+                channel: "nostr",
+                to: senderPubkey,
+                accountId: route.accountId,
+              },
+              onRecordError: (err: unknown) => {
+                ctx.log?.debug?.(`nostr: failed updating session meta: ${String(err)}`);
+              },
+            });
+
+            const tableMode = runtime.channel.text.resolveMarkdownTableMode({
+              cfg,
+              channel: "nostr",
+              accountId: account.accountId,
+            });
+            const textChunkLimit = runtime.channel.text.resolveTextChunkLimit(
+              cfg,
+              "nostr",
+              account.accountId,
+              { fallbackLimit: 4000 },
+            );
+            const chunkMode = runtime.channel.text.resolveChunkMode(
+              cfg,
+              "nostr",
+              account.accountId,
+            );
+
+            const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
+              cfg,
+              agentId: route.agentId,
+              channel: "nostr",
+              accountId: account.accountId,
+            });
+
+            await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+              ctx: ctxPayload,
+              cfg,
+              dispatcherOptions: {
+                ...prefixOptions,
+                deliver: async (payload) => {
+                  const replyText = (payload as { text?: string }).text;
+                  if (replyText) {
+                    const converted = runtime.channel.text.convertMarkdownTables(
+                      replyText,
+                      tableMode,
+                    );
+                    const chunks = runtime.channel.text.chunkTextWithMode(
+                      converted,
+                      textChunkLimit,
+                      chunkMode,
+                    );
+                    for (const chunk of chunks) {
+                      await reply(chunk);
+                    }
+                  }
+                },
+              },
+              replyOptions: {
+                onModelSelected,
+              },
+            });
+          } catch (err) {
+            ctx.log?.error?.(
+              `[${account.accountId}] Failed to dispatch Nostr DM: ${err}`,
+            );
+          }
         },
         onError: (error, context) => {
           ctx.log?.error?.(`[${account.accountId}] Nostr error (${context}): ${error.message}`);
