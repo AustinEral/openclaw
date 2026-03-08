@@ -180,7 +180,9 @@ function schedule(coalesceMs: number, kind: WakeTimerKind = "normal") {
       }
     }
   }, delay);
-  timer.unref?.();
+  // .unref() removed: unreffed timers silently die when the event loop
+  // briefly has zero ref'd handles (e.g. during channel reconnection).
+  // See: #31139, #9084, #9542, #10702
 }
 
 /**

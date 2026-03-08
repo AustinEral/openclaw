@@ -1057,7 +1057,11 @@ export function startHeartbeatRunner(opts: {
       state.timer = null;
       requestHeartbeatNow({ reason: "interval", coalesceMs: 0 });
     }, delay);
-    state.timer.unref?.();
+    // .unref() removed: unreffed timers silently die when the event loop
+    // briefly has zero ref'd handles (e.g. during Telegram stale-socket
+    // reconnection). The cleanup() function already calls clearTimeout(),
+    // so this timer won't block process shutdown.
+    // See: #31139, #9084, #9542, #10702
   };
 
   const updateConfig = (cfg: OpenClawConfig) => {
